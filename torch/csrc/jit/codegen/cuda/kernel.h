@@ -6,6 +6,8 @@
 
 #include <torch/csrc/jit/codegen/cuda/fusion.h>
 
+#include <ATen/core/ivalue.h>
+
 /*
  * The exposed APIs in this file is used by manager.h/cpp
  *

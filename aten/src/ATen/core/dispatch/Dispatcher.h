@@ -1,7 +1,9 @@
 #pragma once
 
+#include <ATen/FunctionSequenceNumber.h>
 #include <ATen/core/dispatch/OperatorEntry.h>
 #include <ATen/core/dispatch/RegistrationHandleRAII.h>
+#include <ATen/record_function.h>
 #include <c10/util/Exception.h>
 #include <c10/util/LeftRight.h>
 #include <mutex>
@@ -281,6 +283,24 @@ private:
 
 namespace detail {
 template<class... Args> inline void unused_arg_(const Args&...) {}
+
+template <typename T, std::enable_if_t<c10::impl::not_ok_to_box<T>::value>* = nullptr>
+inline void push_ivalue_copy(std::vector<c10::IValue>& stack, const T& v) {}
+template <typename T, std::enable_if_t<!c10::impl::not_ok_to_box<T>::value>* = nullptr>
+inline void push_ivalue_copy(std::vector<c10::IValue>& stack, const T& v) {
+  torch::jit::push(stack, v);
+}
+
+template<typename Item>
+void convert_to_ivalue_vector(std::vector<c10::IValue>& stack, const Item& item) {
+  push_ivalue_copy(stack, item);
+}
+template<typename Item, typename... Rest>
+void convert_to_ivalue_vector(std::vector<c10::IValue>& stack, const Item& item, Rest... other_items) {
+  push_ivalue_copy(stack, item);
+  convert_to_ivalue_vector(stack, other_items...);
+}
+void CAFFE2_API convert_to_ivalue_vector(std::vector<c10::IValue>& stack);
 }
 
 template<class Return, class... Args>
@@ -288,6 +308,29 @@ inline Return Dispatcher::callUnboxedWithDispatchKey(const OperatorHandle& op, D
   detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
   const auto& dispatchTable = op.operatorIterator_->op.dispatch_table();
   const KernelFunction& kernel = dispatch_(dispatchTable, dispatchKey);
+
+  // Check if we need to run callbacks registered with RecordFunction
+  // If true and callbacks need inputs, we box the arguments and pass
+  // them into the callbacks and also into the kernel call
+  at::RecordFunction guard(at::RecordScope::FUNCTION);
+  if (guard.active_) {
+    // Stack-based record function with scope lifetime can be markee as 'current'
+    // thread local record function; used to track nested recorded scopes
+    guard._setCurrent();
+    if (guard.needs_inputs_) {
+      std::vector<c10::IValue> stack;
+      detail::convert_to_ivalue_vector(stack, args...);
+
+      guard._before(op.schema().name(), stack, at::FunctionSequenceNumber::peek());
+
+      // if we could convert all the arguments, also pass the stack into the kernel call
+      if (stack.size() == sizeof...(args)) {
+        return kernel.template callUnboxedWithStack<Return, Args...>(op, stack, std::forward<Args>(args)...);
+      }
+    } else {
+      guard._before(op.schema().name(), at::FunctionSequenceNumber::peek());
+    }
+  }
   return kernel.template callUnboxed<Return, Args...>(op, std::forward<Args>(args)...);
 }
 
@@ -308,6 +351,8 @@ inline Return Dispatcher::callUnboxedRedispatch(const OperatorHandle& op, Dispat
     DispatchKeySet(DispatchKeySet::FULL_AFTER, currentDispatchKey),
     args...);
   const KernelFunction& kernel = dispatch_(dispatchTable, dispatchKey);
+
+  // Note: not attempting to use RECORD_FUNCTION to avoid double logging
   return kernel.template callUnboxed<Return, Args...>(op, std::forward<Args>(args)...);
 }
 
@@ -316,6 +361,10 @@ inline void Dispatcher::callBoxed(const OperatorHandle& op, Stack* stack) const 
   const auto& dispatchTable = op.operatorIterator_->op.dispatch_table();
   auto dispatchKey = dispatchTable.dispatchKeyExtractor().getDispatchKeyBoxed(backendsWithoutFallthrough_, stack);
   const KernelFunction& kernel = dispatch_(dispatchTable, dispatchKey);
+
+  // using already existing stack to record function execution in observers
+  RECORD_FUNCTION(op.schema().name(), *stack, at::FunctionSequenceNumber::peek());
+
   kernel.callBoxed(op, stack);
 }
 
